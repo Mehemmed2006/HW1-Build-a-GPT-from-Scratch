@@ -21,42 +21,103 @@ from tokenizer import BPETokenizer
 # 1. CONFIGURATION
 # ==================================================
 
+REQUIRED_KEYS = [
+    "run_id",
+    "n_layer",
+    "n_head",
+    "n_embd",
+    "block_size",
+    "dropout",
+    "batch_size",
+    "max_steps",
+    "max_lr",
+    "warmup_steps",
+    "eval_interval",
+    "seed",
+    "ablation",
+]
+
 def load_config(config_path: str) -> dict:
-    with open(config_path, "r", encoding="utf-8") as file:
+    path = Path(config_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+
+    with path.open("r", encoding="utf-8") as file:
         config = json.load(file)
 
-    required_keys = [
-        "run_id", "n_layer", "n_head", "n_embd",
-        "block_size", "dropout", "batch_size",
-        "max_steps", "max_lr", "warmup_steps",
-        "eval_interval", "seed", "ablation"
+    missing = [
+        key for key in REQUIRED_KEYS
+        if key not in config
     ]
-
-    missing = [key for key in required_keys if key not in config]
 
     if missing:
         raise ValueError(f"Missing config keys: {missing}")
+
+    integer_keys = [
+        "n_layer",
+        "n_head",
+        "n_embd",
+        "block_size",
+        "batch_size",
+        "max_steps",
+        "warmup_steps",
+        "eval_interval",
+        "seed",
+    ]
+
+    for key in integer_keys:
+        if not isinstance(config[key], int) or isinstance(config[key], bool):
+            raise ValueError(f"{key} must be an integer.")
+
+    if config["n_layer"] <= 0:
+        raise ValueError("n_layer must be positive.")
+
+    if config["n_head"] <= 0:
+        raise ValueError("n_head must be positive.")
+
+    if config["n_embd"] <= 0:
+        raise ValueError("n_embd must be positive.")
+
+    if config["n_embd"] % config["n_head"] != 0:
+        raise ValueError("n_embd must be divisible by n_head.")
+
+    if config["block_size"] <= 0:
+        raise ValueError("block_size must be positive.")
+
+    if config["batch_size"] <= 0:
+        raise ValueError("batch_size must be positive.")
 
     if config["max_steps"] <= 0:
         raise ValueError("max_steps must be positive.")
 
     if not 0 <= config["warmup_steps"] < config["max_steps"]:
-        raise ValueError("Invalid warmup_steps value.")
+        raise ValueError("Invalid warmup_steps.")
 
     if config["eval_interval"] <= 0:
         raise ValueError("eval_interval must be positive.")
 
-    if config["batch_size"] <= 0:
-        raise ValueError("batch_size must be positive.")
-
-    if config["block_size"] <= 0:
-        raise ValueError("block_size must be positive.")
-
     if config["max_lr"] <= 0:
         raise ValueError("max_lr must be positive.")
 
-    if not 0 <= config["dropout"] < 1:
-        raise ValueError("dropout must be between 0 and 1.")
+    if not 0.0 <= config["dropout"] < 1.0:
+        raise ValueError("dropout must be in [0, 1).")
+
+    if not isinstance(config["run_id"], str) or not config["run_id"].strip():
+        raise ValueError("run_id must be a non-empty string.")
+
+    if not isinstance(config["ablation"], str):
+        raise ValueError("ablation must be a string.")
+
+    # Optional ablation settings.
+    config.setdefault("use_positional_embeddings", True)
+    config.setdefault("norm_type", "pre")
+
+    if not isinstance(config["use_positional_embeddings"], bool):
+        raise ValueError("use_positional_embeddings must be boolean.")
+
+    if config["norm_type"] not in ("pre", "post"):
+        raise ValueError("norm_type must be 'pre' or 'post'.")
 
     return config
 
@@ -74,11 +135,23 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
+def get_device(requested_device: str = "auto") -> torch.device:
+    if requested_device == "cpu":
+        return torch.device("cpu")
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+
         return torch.device("cuda")
 
-    return torch.device("cpu")
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+
+        return torch.device("cpu")
+
+    raise ValueError("Device must be auto, cpu, or cuda.")
 
 
 # ==================================================
@@ -97,12 +170,12 @@ def load_dataset(tokenizer: BPETokenizer):
 
     text = dataset_path.read_text(encoding="utf-8")
 
+    # First 90% for training, last 10% for validation.
     split_index = int(len(text) * 0.9)
 
     train_text = text[:split_index]
     validation_text = text[split_index:]
 
-    # Identify the exact dataset and tokenizer version.
     fingerprint_source = (
         text + tokenizer_path.read_text(encoding="utf-8")
     )
@@ -118,7 +191,7 @@ def load_dataset(tokenizer: BPETokenizer):
     train_ids = None
     validation_ids = None
 
-    # Load cache only if it belongs to the current data/tokenizer.
+    # Reuse cache only when the dataset and tokenizer match.
     if (
         train_cache.exists()
         and validation_cache.exists()
@@ -134,13 +207,13 @@ def load_dataset(tokenizer: BPETokenizer):
             train_ids = torch.load(
                 train_cache,
                 map_location="cpu",
-                weights_only=True
+                weights_only=True,
             )
 
             validation_ids = torch.load(
                 validation_cache,
                 map_location="cpu",
-                weights_only=True
+                weights_only=True,
             )
 
     if train_ids is None or validation_ids is None:
@@ -148,7 +221,7 @@ def load_dataset(tokenizer: BPETokenizer):
 
         train_ids = torch.tensor(
             tokenizer.encode(train_text),
-            dtype=torch.long
+            dtype=torch.long,
         )
 
         print("Encoding training text: 100%")
@@ -156,17 +229,22 @@ def load_dataset(tokenizer: BPETokenizer):
 
         validation_ids = torch.tensor(
             tokenizer.encode(validation_text),
-            dtype=torch.long
+            dtype=torch.long,
         )
 
         print("Encoding validation text: 100%")
+
+        train_cache.parent.mkdir(parents=True, exist_ok=True)
 
         torch.save(train_ids, train_cache)
         torch.save(validation_ids, validation_cache)
 
         metadata_path.write_text(
-            json.dumps({"fingerprint": fingerprint}, indent=4),
-            encoding="utf-8"
+            json.dumps(
+                {"fingerprint": fingerprint},
+                indent=4,
+            ),
+            encoding="utf-8",
         )
 
     if len(train_ids) <= 1 or len(validation_ids) <= 1:
@@ -186,7 +264,7 @@ def get_batch(
     data: torch.Tensor,
     batch_size: int,
     block_size: int,
-    device: torch.device
+    device: torch.device,
 ):
     if len(data) <= block_size:
         raise ValueError("Dataset is too small for block_size.")
@@ -194,7 +272,7 @@ def get_batch(
     starts = torch.randint(
         0,
         len(data) - block_size,
-        (batch_size,)
+        (batch_size,),
     )
 
     x = torch.stack([
@@ -263,15 +341,15 @@ def create_optimizer(model: GPT, max_lr: float):
         [
             {
                 "params": decay_parameters,
-                "weight_decay": 0.1
+                "weight_decay": 0.1,
             },
             {
                 "params": no_decay_parameters,
-                "weight_decay": 0.0
-            }
+                "weight_decay": 0.0,
+            },
         ],
         lr=max_lr,
-        betas=(0.9, 0.95)
+        betas=(0.9, 0.95),
     )
 
     return optimizer
@@ -287,7 +365,7 @@ def estimate_validation_loss(
     validation_ids: torch.Tensor,
     config: dict,
     device: torch.device,
-    number_of_batches: int = 50
+    number_of_batches: int = 50,
 ):
     was_training = model.training
     model.eval()
@@ -301,7 +379,7 @@ def estimate_validation_loss(
                 validation_ids,
                 config["batch_size"],
                 config["block_size"],
-                device
+                device,
             )
 
             _, loss = model(x, y)
@@ -316,6 +394,7 @@ def estimate_validation_loss(
             if completed % 5 == 0 or completed == number_of_batches:
                 elapsed = time.time() - start_time
                 percentage = completed / number_of_batches * 100
+
                 remaining = (
                     elapsed / completed
                 ) * (number_of_batches - completed)
@@ -342,7 +421,7 @@ LOG_COLUMNS = [
     "train_loss",
     "val_loss",
     "lr",
-    "tokens_seen"
+    "tokens_seen",
 ]
 
 RUN_COLUMNS = [
@@ -358,7 +437,7 @@ RUN_COLUMNS = [
     "best_val_loss",
     "final_train_loss",
     "tokens_per_sec",
-    "wall_time_min"
+    "wall_time_min",
 ]
 
 
@@ -368,11 +447,11 @@ def append_log(log_path: Path, row: dict) -> None:
     with log_path.open(
         "a",
         newline="",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=LOG_COLUMNS
+            fieldnames=LOG_COLUMNS,
         )
 
         if not file_exists:
@@ -383,14 +462,13 @@ def append_log(log_path: Path, row: dict) -> None:
 
 def update_runs_csv(config: dict, results: dict) -> None:
     runs_path = Path("runs.csv")
-
     rows = []
 
     if runs_path.exists():
         with runs_path.open(
             "r",
             newline="",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as file:
             reader = csv.DictReader(file)
             rows = list(reader)
@@ -408,9 +486,10 @@ def update_runs_csv(config: dict, results: dict) -> None:
         "best_val_loss": results["best_val_loss"],
         "final_train_loss": results["final_train_loss"],
         "tokens_per_sec": results["tokens_per_sec"],
-        "wall_time_min": results["wall_time_min"]
+        "wall_time_min": results["wall_time_min"],
     }
 
+    # Replace only the row with the same run_id.
     rows = [
         row for row in rows
         if row.get("run_id") != config["run_id"]
@@ -421,11 +500,11 @@ def update_runs_csv(config: dict, results: dict) -> None:
     with runs_path.open(
         "w",
         newline="",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=RUN_COLUMNS
+            fieldnames=RUN_COLUMNS,
         )
 
         writer.writeheader()
@@ -433,47 +512,64 @@ def update_runs_csv(config: dict, results: dict) -> None:
 
 
 # ==================================================
-# 9. TRAINING
+# 9. MODEL CREATION
 # ==================================================
 
-def train(config_path: str) -> None:
-    config = load_config(config_path)
-
-    set_seed(config["seed"])
-
-    device = get_device()
-
-    print("=" * 55)
-    print("GPT TRAINING")
-    print("=" * 55)
-    print(f"Run ID: {config['run_id']}")
-    print(f"Device: {device}")
-
-    # Load tokenizer.
-    print("\nLoading tokenizer...")
-    tokenizer = BPETokenizer.load("tokenizer.json")
-
-    vocab_size = len(tokenizer.token_bytes)
-
-    print(f"Vocabulary size: {vocab_size}")
-
-    # Load dataset.
-    print("\nLoading dataset...")
-    train_ids, validation_ids = load_dataset(tokenizer)
-
-    # Create model.
-    print("\nCreating GPT model...")
-
+def create_model(config: dict, vocab_size: int) -> GPT:
     model_config = GPTConfig(
         vocab_size=vocab_size,
         block_size=config["block_size"],
         n_layer=config["n_layer"],
         n_head=config["n_head"],
         n_embd=config["n_embd"],
-        dropout=config["dropout"]
+        dropout=config["dropout"],
+        use_positional_embeddings=config["use_positional_embeddings"],
+        norm_type=config["norm_type"],
     )
 
-    model = GPT(model_config).to(device)
+    return GPT(model_config)
+
+
+# ==================================================
+# 10. TRAINING
+# ==================================================
+
+def train(config_path: str, requested_device: str = "auto") -> None:
+    config = load_config(config_path)
+
+    set_seed(config["seed"])
+
+    device = get_device(requested_device)
+
+    print("=" * 55)
+    print("GPT TRAINING")
+    print("=" * 55)
+
+    print(f"Run ID: {config['run_id']}")
+    print(f"Ablation: {config['ablation']}")
+    print(f"Device: {device}")
+    print(f"Learning rate: {config['max_lr']}")
+    print(f"Warmup steps: {config['warmup_steps']}")
+    print(f"Positional embeddings: {config['use_positional_embeddings']}")
+    print(f"Normalization: {config['norm_type']}")
+
+    # Load tokenizer.
+    print("\nLoading tokenizer...")
+
+    tokenizer = BPETokenizer.load("tokenizer.json")
+    vocab_size = len(tokenizer.token_bytes)
+
+    print(f"Vocabulary size: {vocab_size}")
+
+    # Load dataset.
+    print("\nLoading dataset...")
+
+    train_ids, validation_ids = load_dataset(tokenizer)
+
+    # Create model.
+    print("\nCreating GPT model...")
+
+    model = create_model(config, vocab_size).to(device)
 
     parameter_count = model.num_params()
 
@@ -482,7 +578,7 @@ def train(config_path: str) -> None:
     # Create optimizer.
     optimizer = create_optimizer(
         model,
-        config["max_lr"]
+        config["max_lr"],
     )
 
     Path("logs").mkdir(exist_ok=True)
@@ -504,7 +600,7 @@ def train(config_path: str) -> None:
 
     for step in range(config["max_steps"]):
 
-        # Set learning rate.
+        # Update learning rate.
         learning_rate = get_learning_rate(step, config)
 
         for group in optimizer.param_groups:
@@ -517,7 +613,7 @@ def train(config_path: str) -> None:
             train_ids,
             config["batch_size"],
             config["block_size"],
-            device
+            device,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -534,7 +630,7 @@ def train(config_path: str) -> None:
         # Gradient clipping.
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
-            max_norm=1.0
+            max_norm=1.0,
         )
 
         optimizer.step()
@@ -547,10 +643,10 @@ def train(config_path: str) -> None:
 
         current_step = step + 1
 
-        # Show training progress every 1% or at the final step.
+        # Training progress: every 1%.
         progress_interval = max(
             1,
-            config["max_steps"] // 100
+            config["max_steps"] // 100,
         )
 
         if (
@@ -580,7 +676,7 @@ def train(config_path: str) -> None:
                 f"Remaining: {remaining / 60:.1f} min"
             )
 
-        # Evaluate at the requested interval and final step.
+        # Evaluate at the configured interval and final step.
         should_evaluate = (
             current_step % config["eval_interval"] == 0
             or current_step == config["max_steps"]
@@ -596,7 +692,7 @@ def train(config_path: str) -> None:
                 validation_ids,
                 config,
                 device,
-                number_of_batches=50
+                number_of_batches=50,
             )
 
             append_log(
@@ -606,8 +702,8 @@ def train(config_path: str) -> None:
                     "train_loss": final_train_loss,
                     "val_loss": validation_loss,
                     "lr": learning_rate,
-                    "tokens_seen": tokens_seen
-                }
+                    "tokens_seen": tokens_seen,
+                },
             )
 
             print(
@@ -627,11 +723,11 @@ def train(config_path: str) -> None:
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
-                        "model_config": vars(model_config),
+                        "model_config": vars(model.config),
                         "step": current_step,
-                        "best_val_loss": best_val_loss
+                        "best_val_loss": best_val_loss,
                     },
-                    checkpoint_path
+                    checkpoint_path,
                 )
 
                 print(
@@ -657,7 +753,7 @@ def train(config_path: str) -> None:
         "best_val_loss": best_val_loss,
         "final_train_loss": final_train_loss,
         "tokens_per_sec": tokens_per_sec,
-        "wall_time_min": wall_time / 60
+        "wall_time_min": wall_time / 60,
     }
 
     update_runs_csv(config, results)
@@ -665,6 +761,7 @@ def train(config_path: str) -> None:
     print("\n" + "=" * 55)
     print("TRAINING COMPLETED: 100%")
     print("=" * 55)
+
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Final training loss: {final_train_loss:.4f}")
     print(f"Tokens per second: {tokens_per_sec:.2f}")
@@ -674,7 +771,7 @@ def train(config_path: str) -> None:
 
 
 # ==================================================
-# 10. COMMAND-LINE INTERFACE
+# 11. COMMAND-LINE INTERFACE
 # ==================================================
 
 def main():
@@ -686,12 +783,23 @@ def main():
         "--config",
         type=str,
         required=True,
-        help="Path to the JSON configuration file."
+        help="Path to the JSON configuration file.",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Training device. Default: auto.",
     )
 
     args = parser.parse_args()
 
-    train(args.config)
+    train(
+        args.config,
+        requested_device=args.device,
+    )
 
 
 if __name__ == "__main__":

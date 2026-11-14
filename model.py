@@ -15,6 +15,8 @@ class GPTConfig:
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.1
+    use_positional_embeddings: bool = True
+    norm_type: str = "pre"
 
     def __post_init__(self):
         if self.vocab_size <= 0:
@@ -31,10 +33,12 @@ class GPTConfig:
             raise ValueError("n_embd must be divisible by n_head")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in the range [0, 1)")
+        if self.norm_type not in ("pre", "post"):
+            raise ValueError("norm_type must be 'pre' or 'post'")
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention implemented manually."""
+    """Manual multi-head causal self-attention."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -43,22 +47,14 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
 
-        self.qkv = nn.Linear(
-            config.n_embd, 3 * config.n_embd, bias=False
-        )
-        self.proj = nn.Linear(
-            config.n_embd, config.n_embd, bias=False
-        )
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
         mask = torch.tril(
-            torch.ones(
-                config.block_size,
-                config.block_size,
-                dtype=torch.bool,
-            )
+            torch.ones(config.block_size, config.block_size, dtype=torch.bool)
         )
         self.register_buffer("causal_mask", mask)
 
@@ -68,10 +64,8 @@ class CausalSelfAttention(nn.Module):
         if seq_len > self.causal_mask.size(0):
             raise ValueError("Sequence length exceeds block_size")
 
-        # Produce query, key, and value vectors.
         q, k, v = self.qkv(x).chunk(3, dim=-1)
 
-        # Split into attention heads.
         q = q.view(
             batch_size, seq_len, self.n_head, self.head_dim
         ).transpose(1, 2)
@@ -84,11 +78,8 @@ class CausalSelfAttention(nn.Module):
             batch_size, seq_len, self.n_head, self.head_dim
         ).transpose(1, 2)
 
-        # Manual scaled dot-product attention.
-        scores = q @ k.transpose(-2, -1)
-        scores = scores / math.sqrt(self.head_dim)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # Prevent attending to future positions.
         mask = self.causal_mask[:seq_len, :seq_len]
         scores = scores.masked_fill(~mask, float("-inf"))
 
@@ -97,7 +88,6 @@ class CausalSelfAttention(nn.Module):
 
         y = weights @ v
 
-        # Merge attention heads.
         y = y.transpose(1, 2).contiguous()
         y = y.view(batch_size, seq_len, channels)
 
@@ -108,17 +98,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Feed-forward network used inside each Transformer block."""
+    """Feed-forward network."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
 
-        self.fc1 = nn.Linear(
-            config.n_embd, 4 * config.n_embd, bias=False
-        )
-        self.fc2 = nn.Linear(
-            4 * config.n_embd, config.n_embd, bias=False
-        )
+        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -130,10 +116,12 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer block."""
+    """Supports Pre-LN and Post-LN Transformer blocks."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
+
+        self.norm_type = config.norm_type
 
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -142,8 +130,13 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        if self.norm_type == "pre":
+            x = x + self.attn(self.ln1(x))
+            x = x + self.mlp(self.ln2(x))
+        else:
+            x = self.ln1(x + self.attn(x))
+            x = self.ln2(x + self.mlp(x))
+
         return x
 
 
@@ -158,17 +151,20 @@ class GPT(nn.Module):
         self.token_embedding = nn.Embedding(
             config.vocab_size, config.n_embd
         )
-        self.position_embedding = nn.Embedding(
-            config.block_size, config.n_embd
-        )
+
+        if config.use_positional_embeddings:
+            self.position_embedding = nn.Embedding(
+                config.block_size, config.n_embd
+            )
+        else:
+            self.position_embedding = None
+
         self.embedding_dropout = nn.Dropout(config.dropout)
 
-        self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(config)
-                for _ in range(config.n_layer)
-            ]
-        )
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config)
+            for _ in range(config.n_layer)
+        ])
 
         self.final_ln = nn.LayerNorm(config.n_embd)
 
@@ -176,12 +172,10 @@ class GPT(nn.Module):
             config.n_embd, config.vocab_size, bias=False
         )
 
-        # Share the output projection weight with token embeddings.
         self.lm_head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
 
-        # Ensure LayerNorm parameters have the required initialization.
         for module in self.modules():
             if isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
@@ -200,6 +194,7 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+
         if idx.ndim != 2:
             raise ValueError("idx must have shape (batch, sequence)")
 
@@ -208,14 +203,14 @@ class GPT(nn.Module):
         if seq_len > self.config.block_size:
             raise ValueError("Sequence length exceeds block_size")
 
-        positions = torch.arange(
-            seq_len, device=idx.device
-        )
-
         token_emb = self.token_embedding(idx)
-        position_emb = self.position_embedding(positions)
+        x = token_emb
 
-        x = token_emb + position_emb
+        if self.position_embedding is not None:
+            positions = torch.arange(seq_len, device=idx.device)
+            position_emb = self.position_embedding(positions)
+            x = x + position_emb
+
         x = self.embedding_dropout(x)
 
         for block in self.blocks:
@@ -225,6 +220,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
 
         loss = None
+
         if targets is not None:
             if targets.shape != idx.shape:
                 raise ValueError("targets must have the same shape as idx")
