@@ -38,7 +38,7 @@ class GPTConfig:
 
 
 class CausalSelfAttention(nn.Module):
-    """Manual multi-head causal self-attention."""
+    """Manual multi-head causal attention with KV cache."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -54,15 +54,21 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
         mask = torch.tril(
-            torch.ones(config.block_size, config.block_size, dtype=torch.bool)
+            torch.ones(
+                config.block_size,
+                config.block_size,
+                dtype=torch.bool,
+            )
         )
         self.register_buffer("causal_mask", mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ):
         batch_size, seq_len, channels = x.shape
-
-        if seq_len > self.causal_mask.size(0):
-            raise ValueError("Sequence length exceeds block_size")
 
         q, k, v = self.qkv(x).chunk(3, dim=-1)
 
@@ -78,9 +84,34 @@ class CausalSelfAttention(nn.Module):
             batch_size, seq_len, self.n_head, self.head_dim
         ).transpose(1, 2)
 
+        past_len = 0
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            past_len = past_k.size(2)
+
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+
+        total_len = k.size(2)
+
+        if total_len > self.causal_mask.size(0):
+            raise ValueError("Sequence length exceeds block_size")
+
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        mask = self.causal_mask[:seq_len, :seq_len]
+        query_positions = torch.arange(
+            past_len,
+            past_len + seq_len,
+            device=x.device,
+        )
+        key_positions = torch.arange(total_len, device=x.device)
+
+        mask = (
+            key_positions.unsqueeze(0)
+            <= query_positions.unsqueeze(1)
+        )
+
         scores = scores.masked_fill(~mask, float("-inf"))
 
         weights = F.softmax(scores, dim=-1)
@@ -93,6 +124,9 @@ class CausalSelfAttention(nn.Module):
 
         y = self.proj(y)
         y = self.resid_dropout(y)
+
+        if use_cache:
+            return y, (k, v)
 
         return y
 
@@ -116,7 +150,7 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Supports Pre-LN and Post-LN Transformer blocks."""
+    """Transformer block supporting Pre-LN and Post-LN."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -129,19 +163,46 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ):
         if self.norm_type == "pre":
-            x = x + self.attn(self.ln1(x))
+            if use_cache:
+                attn_output, present_kv = self.attn(
+                    self.ln1(x),
+                    past_kv=past_kv,
+                    use_cache=True,
+                )
+            else:
+                attn_output = self.attn(self.ln1(x))
+
+            x = x + attn_output
             x = x + self.mlp(self.ln2(x))
+
         else:
-            x = self.ln1(x + self.attn(x))
+            if use_cache:
+                attn_output, present_kv = self.attn(
+                    x,
+                    past_kv=past_kv,
+                    use_cache=True,
+                )
+            else:
+                attn_output = self.attn(x)
+
+            x = self.ln1(x + attn_output)
             x = self.ln2(x + self.mlp(x))
+
+        if use_cache:
+            return x, present_kv
 
         return x
 
 
 class GPT(nn.Module):
-    """Decoder-only GPT language model."""
+    """Decoder-only GPT language model with optional KV cache."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -149,12 +210,14 @@ class GPT(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(
-            config.vocab_size, config.n_embd
+            config.vocab_size,
+            config.n_embd,
         )
 
         if config.use_positional_embeddings:
             self.position_embedding = nn.Embedding(
-                config.block_size, config.n_embd
+                config.block_size,
+                config.n_embd,
             )
         else:
             self.position_embedding = None
@@ -169,7 +232,9 @@ class GPT(nn.Module):
         self.final_ln = nn.LayerNorm(config.n_embd)
 
         self.lm_head = nn.Linear(
-            config.n_embd, config.vocab_size, bias=False
+            config.n_embd,
+            config.vocab_size,
+            bias=False,
         )
 
         self.lm_head.weight = self.token_embedding.weight
@@ -193,28 +258,61 @@ class GPT(nn.Module):
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-
+        past_key_values: tuple | None = None,
+        use_cache: bool = False,
+    ):
         if idx.ndim != 2:
             raise ValueError("idx must have shape (batch, sequence)")
 
         batch_size, seq_len = idx.shape
 
-        if seq_len > self.config.block_size:
+        if past_key_values is not None:
+            if len(past_key_values) != self.config.n_layer:
+                raise ValueError("Invalid number of cached layers")
+
+            past_len = past_key_values[0][0].size(2)
+
+            for past_k, past_v in past_key_values:
+                if past_k.size(2) != past_len or past_v.size(2) != past_len:
+                    raise ValueError("Inconsistent KV cache lengths")
+        else:
+            past_len = 0
+
+        if past_len + seq_len > self.config.block_size:
             raise ValueError("Sequence length exceeds block_size")
 
         token_emb = self.token_embedding(idx)
         x = token_emb
 
         if self.position_embedding is not None:
-            positions = torch.arange(seq_len, device=idx.device)
+            positions = torch.arange(
+                past_len,
+                past_len + seq_len,
+                device=idx.device,
+            )
             position_emb = self.position_embedding(positions)
             x = x + position_emb
 
         x = self.embedding_dropout(x)
 
-        for block in self.blocks:
-            x = block(x)
+        presents = []
+
+        for layer_index, block in enumerate(self.blocks):
+            layer_past = (
+                past_key_values[layer_index]
+                if past_key_values is not None
+                else None
+            )
+
+            if use_cache:
+                x, present_kv = block(
+                    x,
+                    past_kv=layer_past,
+                    use_cache=True,
+                )
+                presents.append(present_kv)
+            else:
+                x = block(x, past_kv=layer_past)
 
         x = self.final_ln(x)
         logits = self.lm_head(x)
@@ -229,6 +327,9 @@ class GPT(nn.Module):
                 logits.reshape(-1, self.config.vocab_size),
                 targets.reshape(-1),
             )
+
+        if use_cache:
+            return logits, loss, tuple(presents)
 
         return logits, loss
 
