@@ -4,56 +4,53 @@ The bug that cost me the most time occurred during the implementation of the byt
 
 The main symptom was an `IndexError` during the merge process:
 
-`IndexError: index 978850 is out of bounds for axis 0 with size 978844`
+```text
+IndexError: index 978850 is out of bounds for axis 0 with size 978844
+```
 
 The problem occurred because token-pair positions became invalid after elements were removed from the sequence. The merge operation was using positions calculated before the sequence was modified.
 
-I identified the issue by examining the indexing logic and checking how the sequence length changed after each merge. I fixed the position handling by adjusting the remaining positions after deletions and ensuring that the merge operation used valid indices.
+I identified the issue by examining the indexing logic and checking how the sequence length changed during the merge process. I corrected the position handling to ensure that the merge operation used valid indices and performed non-overlapping merges from left to right.
 
-The related commit is **`4248f23` – Day 2: Implement byte-level BPE tokenizer**.
-
-I followed a commit policy in which I committed the completed work at the end of each day. I did not create a commit while known bugs or incomplete tasks remained. Therefore, the bug fix was included in the general Day 2 commit rather than being recorded in a separate bug-fix commit.
-
-
+The original tokenizer implementation is recorded in commit `4248f23` – `Day 2: Implement byte-level BPE tokenizer`. The investigation and its explanation were documented separately in a later documentation commit.
 
 ## R2. Which experiment result surprised you the most?
 
 The experiment that surprised me the most was A4, in which dropout was removed from the model.
 
-The M baseline achieved a final training loss of **3.5255** and a best holdout shard loss of **3.7745**. In comparison, A4 achieved a much lower final training loss of **2.8950**, while its best holdout shard loss was **3.7708**.
+The baseline model M achieved a final training loss of **3.5255** and a best holdout shard loss of **3.7745**. In comparison, A4 achieved a much lower final training loss of **2.8950**, while its best holdout shard loss was **3.7708**.
 
-This result was surprising because removing dropout significantly improved the training loss, but it barely changed the holdout shard loss. The difference in holdout shard loss was only **0.0037**.
+This result was surprising because removing dropout significantly reduced the training loss but barely changed the holdout shard loss. The difference between the two holdout shard losses was only **0.0037**.
 
-This suggests that the model fitted the training data more closely without dropout, but this did not lead to a meaningful improvement in performance on unseen data.
+This suggests that the model fitted the training data more closely without dropout, but this did not produce a meaningful improvement in its performance on unseen data.
 
-**Relevant runs:** `M` and `A4` (A4: `A4_no_dropout`).
-
+**Relevant runs:** `M` and `A4` (`A4_no_dropout`).
 
 ## R3. Which single change had the largest effect on validation loss?
 
-The removal of positional embeddings (A1) had the largest negative effect on the holdout shard loss among the controlled ablation experiments.
+Among the controlled ablation experiments, removing positional embeddings (A1) had the largest negative effect on the holdout shard loss.
 
 The baseline model M achieved a best holdout shard loss of **3.7745**, while A1 achieved **4.0141**. This represents an increase of approximately **0.2396** in loss.
 
-This result indicates that positional embeddings play an important role in the model's ability to understand token order and position. Without positional information, the model performed worse on the holdout shard.
+This result indicates that positional embeddings are important because they provide the model with information about token order and position. Without positional embeddings, the model performed worse on the holdout shard.
 
 **Compared runs:** `M` and `A1` (`A1_no_positional_embeddings`).
 
-
-
 ## R4. Generate 3 samples of 120 tokens from run L at temperature 0.8. Describe one failure pattern and connect it to a design choice.
 
-I generated three text samples using the GPT-L model (2,880,384 parameters) with the prompt "ROMEO:". Each sample contained 120 newly generated tokens. I used top-p sampling with a temperature of 0.8 and a top-p value of 0.9.
+I generated three text samples using the GPT-L model, which contains **2,880,384 parameters**. I used the prompt `"ROMEO:"` and generated 120 new tokens for each sample.
 
-One noticeable failure pattern was grammatical and semantic inconsistency. For example, the generated text contained phrases such as "By no honour of your appetition" and "a gentle dancture". Although the model learned Shakespeare-like vocabulary, character names, and dialogue structures, some sentences were difficult to understand.
+The generation settings were temperature **0.8**, top-p **0.9**, and top-p sampling. The samples were generated using the checkpoint `checkpoints/L_best.pt`.
 
-This limitation is related to the model's relatively small architecture and limited training data. The model learned local language patterns but struggled to maintain grammatical accuracy and coherent meaning over longer passages. Top-p sampling also introduced variation in the generated text.
+One noticeable failure pattern was grammatical and semantic inconsistency. For example, the generated text contained phrases such as `"By no honour of your appetition"` and `"a gentle dancture"`. Although the model learned Shakespeare-like vocabulary, character names, and dialogue structures, some generated sentences were difficult to understand.
 
-**Model:** L  
-**Prompt:** ROMEO:  
-**Generation settings:** 120 tokens per sample, temperature 0.8, top-p 0.9  
-**Output file:** samples.txt
+This limitation is related to the model's relatively small architecture and limited training data. The model learned local language patterns but struggled to maintain grammatical accuracy and coherent meaning over longer passages. Top-p sampling also introduced variation into the generated text.
 
+**Run ID:** `L`  
+**Prompt:** `ROMEO:`  
+**Generation settings:** 120 new tokens per sample, temperature 0.8, top-p 0.9  
+**Checkpoint:** `checkpoints/L_best.pt`  
+**Output file:** `samples.txt`
 
 ## R5. List the first 10 merges as text and bytes-per-token on the validation text. Why do the first merges look like that?
 
@@ -74,10 +71,10 @@ The first 10 BPE merges learned by my tokenizer were:
 
 The holdout shard contained **111,540 bytes** and **46,683 tokens**.
 
-Bytes per token:
+The average number of bytes per token was:
 
 **111,540 / 46,683 = 2.3893 bytes per token.**
 
 The first merges look like this because BPE selects the most frequent adjacent byte pairs in the training text. Common English letter combinations, such as `th`, `ou`, and `er`, occur frequently. Pairs containing spaces, such as `e ` and `t `, are also common because they frequently appear at word boundaries.
 
-These merges show that the tokenizer learns frequent patterns directly from the text without requiring predefined word boundaries.
+These results show that the tokenizer learns frequent patterns directly from the text without requiring predefined word boundaries.
