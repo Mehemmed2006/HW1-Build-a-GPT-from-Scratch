@@ -1,3 +1,5 @@
+# Part F – Report Answers
+
 ## R1. Which bug cost you the most time?
 
 The bug that cost me the most time occurred during the implementation of the byte-level BPE tokenizer.
@@ -12,7 +14,7 @@ The problem occurred because token-pair positions became invalid after elements 
 
 I identified the issue by examining the indexing logic and checking how the sequence length changed during the merge process. I corrected the position handling to ensure that the merge operation used valid indices and performed non-overlapping merges from left to right.
 
-The original tokenizer implementation is recorded in commit `4248f23` – `Day 2: Implement byte-level BPE tokenizer`. The investigation and its explanation were documented separately in a later documentation commit.
+The original tokenizer implementation is recorded in commit `4248f23` – `Day 2: Implement byte-level BPE tokenizer`. The investigation and its explanation are documented in commit `37c44d7` – `docs: document BPE tokenizer bug investigation`.
 
 ## R2. Which experiment result surprised you the most?
 
