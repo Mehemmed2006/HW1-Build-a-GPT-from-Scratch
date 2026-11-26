@@ -1,6 +1,3 @@
-
-# hw1-build: caspian-7
-
 import csv
 from pathlib import Path
 

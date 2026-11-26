@@ -1,82 +1,60 @@
-# Part F – Report Answers
+Part F – Reflection Answers
 
-## R1. Which bug cost you the most time?
+All numbers come from runs.csv, logs/<run_id>.csv, samples.txt and the tokenizer file. Training loss in the logs is the loss of a single batch, so it is noisy. Validation loss is the mean over 50 random validation batches.
 
-The bug that cost me the most time occurred during the implementation of the byte-level BPE tokenizer.
+### R1. Which bug cost you the most time?
 
-The main symptom was an `IndexError` during the merge process:
+**Symptom:** While training the byte-level BPE tokenizer, I encountered the following error:
 
 ```text
 IndexError: index 978850 is out of bounds for axis 0 with size 978844
 ```
 
-The problem occurred because token-pair positions became invalid after elements were removed from the sequence. The merge operation was using positions calculated before the sequence was modified.
+**Cause:** The merge operation used pair positions calculated before modifying the token sequence. When a merge removed elements, the sequence became shorter, but the previously stored positions remained unchanged. As a result, some positions pointed outside the sequence boundaries.
 
-I identified the issue by examining the indexing logic and checking how the sequence length changed during the merge process. I corrected the position handling to ensure that the merge operation used valid indices and performed non-overlapping merges from left to right.
+**How I found it:** I investigated how the sequence length changed during merging and compared the stored pair positions with the updated sequence length. This helped me identify that the problem was caused by using outdated positions after modifying the sequence.
 
-The original tokenizer implementation is recorded in commit `4248f23` – `Day 2: Implement byte-level BPE tokenizer`. The investigation and its explanation are documented in commit `37c44d7` – `docs: document BPE tokenizer bug investigation`.
+**Fix:** I rewrote the merge operation to scan the current sequence once, from left to right, and replace non-overlapping occurrences as it goes. This avoids using outdated positions and prevents the index error.
 
-## R2. Which experiment result surprised you the most?
+The initial byte-level BPE tokenizer implementation is recorded in commit `4248f23` (Implement byte-level BPE tokenizer). The bug investigation and documentation are recorded in commits `bc26726` and `37c44d7`.
 
-The experiment that surprised me the most was A4, in which dropout was removed from the model.
+R2. Which experiment result surprised you most?
 
-The baseline model M achieved a final training loss of **3.5255** and a best holdout shard loss of **3.7745**. In comparison, A4 achieved a much lower final training loss of **2.8950**, while its best holdout shard loss was **3.7708**.
+Removing dropout (A4) changed the validation loss almost not at all, while the training loss moved a lot.
 
-This result was surprising because removing dropout significantly reduced the training loss but barely changed the holdout shard loss. The difference between the two holdout shard losses was only **0.0037**.
+Run	final_train_loss	best_val_loss	train–val gap at step 3000
+M (dropout 0.1)	3.5255	3.7745	0.249
+A4 (dropout 0.0)	2.8950	3.7708	0.876
 
-This suggests that the model fitted the training data more closely without dropout, but this did not produce a meaningful improvement in its performance on unseen data.
+The validation difference is only 0.0037, which is within the noise of a single seed and a 50-batch estimate. The logs show that A4 learned faster early (validation 3.8380 at step 1500 against 3.9909 for M, logs/A4.csv and logs/M.csv), but M caught up by step 3000. My explanation: without dropout the model fits the training text much more closely (the gap is 3.5 times larger), but on this small corpus and in 3000 steps this does not translate into better validation loss. I did not test longer training, where the gap might matter more. Runs: M, A4.
 
-**Relevant runs:** `M` and `A4` (`A4_no_dropout`).
+R3. Which single change had the largest effect on validation loss?
 
-## R3. Which single change had the largest effect on validation loss?
+Among the single-factor ablations, removing the position embedding (A1) had the largest effect: best validation loss rose from 3.7745 (M) to 4.0141 (A1), an increase of 0.2396. Without positions the model only sees token content and has no direct order information, even though the causal mask still gives it some implicit order.
 
-Among the controlled ablation experiments, removing positional embeddings (A1) had the largest negative effect on the holdout shard loss.
+For comparison, the scaling runs changed more: S (4.2735) against M (3.7745) differs by 0.4988, but S changes depth, width and head count at once, so I do not count it as a single change. The other ablations were smaller: A2 +0.0518, A3 −0.0707, A4 −0.0037, A5 −0.1003 (A5 also saw twice as many tokens). Compared runs: M and A1.
 
-The baseline model M achieved a best holdout shard loss of **3.7745**, while A1 achieved **4.0141**. This represents an increase of approximately **0.2396** in loss.
+R4. Three samples of 120 tokens from run L at temperature 0.8
 
-This result indicates that positional embeddings are important because they provide the model with information about token order and position. Without positional embeddings, the model performed worse on the holdout shard.
+I generated 3 samples from checkpoints/L_best.pt (run L, 2,880,384 parameters) with prompt ROMEO:, 120 new tokens, temperature 0.8, seed 1, without top-k or top-p. The samples are in samples.txt.
 
-**Compared runs:** `M` and `A1` (`A1_no_positional_embeddings`).
+Failure pattern: invented words. The model gets the play format right (speaker labels such as Nurse: and JULIET:, short verse lines), but it produces non-words built from plausible fragments: infurthorse and particient (sample 1), nuptedious and househood (sample 2), askied and provate (sample 3).
 
-## R4. Generate 3 samples of 120 tokens from run L at temperature 0.8. Describe one failure pattern and connect it to a design choice.
+Connection to a design choice. I think this is related to the tokenizer: with vocab_size = 1024 and 2.39 bytes per token (R5), most words are split into several fragments, and the model can combine fragments into strings that never occur in the text. Model size and data also matter: logs/L.csv shows training loss 2.9025 against validation loss 3.6629 at step 3000, a gap of 0.760 (0.249 for M), so L fits the small corpus but does not generalize cleanly. I did not run an experiment that separates these causes, so this is a hypothesis.
 
-I generated three text samples using the GPT-L model, which contains **2,880,384 parameters**. I used the prompt `"ROMEO:"` and generated 120 new tokens for each sample.
+R5. First 10 merges and bytes per token
+Merge	Token id	Pair	Text
+0	256	(101, 32)	e 
+1	257	(116, 104)	th
+2	258	(116, 32)	t 
+3	259	(115, 32)	s 
+4	260	(100, 32)	d 
+5	261	(44, 32)	, 
+6	262	(111, 117)	ou
+7	263	(101, 114)	er
+8	264	(105, 110)	in
+9	265	(121, 32)	y 
 
-The generation settings were temperature **0.8**, top-p **0.9**, and top-p sampling. The samples were generated using the checkpoint `checkpoints/L_best.pt`.
+The validation text has 111,540 bytes and 46,683 tokens, so the tokenizer gives 111,540 / 46,683 = 2.3893 bytes per token.
 
-One noticeable failure pattern was grammatical and semantic inconsistency. For example, the generated text contained phrases such as `"By no honour of your appetition"` and `"a gentle dancture"`. Although the model learned Shakespeare-like vocabulary, character names, and dialogue structures, some generated sentences were difficult to understand.
-
-This limitation is related to the model's relatively small architecture and limited training data. The model learned local language patterns but struggled to maintain grammatical accuracy and coherent meaning over longer passages. Top-p sampling also introduced variation into the generated text.
-
-**Run ID:** `L`  
-**Prompt:** `ROMEO:`  
-**Generation settings:** 120 new tokens per sample, temperature 0.8, top-p 0.9  
-**Checkpoint:** `checkpoints/L_best.pt`  
-**Output file:** `samples.txt`
-
-## R5. List the first 10 merges as text and bytes-per-token on the validation text. Why do the first merges look like that?
-
-The first 10 BPE merges learned by my tokenizer were:
-
-| Merge | Token IDs | Merged text | Bytes (hex) |
-|---:|---|---|---|
-| 1 | (101, 32) | `e ` | `65 20` |
-| 2 | (116, 104) | `th` | `74 68` |
-| 3 | (116, 32) | `t ` | `74 20` |
-| 4 | (115, 32) | `s ` | `73 20` |
-| 5 | (100, 32) | `d ` | `64 20` |
-| 6 | (44, 32) | `, ` | `2C 20` |
-| 7 | (111, 117) | `ou` | `6F 75` |
-| 8 | (101, 114) | `er` | `65 72` |
-| 9 | (105, 110) | `in` | `69 6E` |
-| 10 | (121, 32) | `y ` | `79 20` |
-
-The holdout shard contained **111,540 bytes** and **46,683 tokens**.
-
-The average number of bytes per token was:
-
-**111,540 / 46,683 = 2.3893 bytes per token.**
-
-The first merges look like this because BPE selects the most frequent adjacent byte pairs in the training text. Common English letter combinations, such as `th`, `ou`, and `er`, occur frequently. Pairs containing spaces, such as `e ` and `t `, are also common because they frequently appear at word boundaries.
-
-These results show that the tokenizer learns frequent patterns directly from the text without requiring predefined word boundaries.
+Each merge is the most frequent adjacent pair at that moment in the training text. Six of the ten merges end in a space (e , t , s , d , , , y ): because there is no pre-splitting into words, a letter at the end of a word can merge with the following space, and in English e, t, s, d, y are very common word endings, while a comma is almost always followed by a space. The other four (th, ou, er, in) are among the most common letter pairs in English.
